@@ -1,4 +1,3 @@
-
 import Pkg
 println("--- 🔎 Verifying Libraries ---")
 required_packages = ["HTTP", "JSON", "Dates", "DataFrames", "Statistics", "Random"]
@@ -12,7 +11,7 @@ using HTTP, JSON, Dates, DataFrames, Statistics, Random
 println("--- ✅ Libraries Ready ---\n")
 
 # 🔴 PASTE YOUR KEYS HERE 🔴
-const API_KEY = "YOUR ALPACA API KEY"       
+const API_KEY = "YOUR ALPACA API KEY"        
 const SECRET_KEY = "YOUR ALPACA SECRET KEY" 
 const BASE_URL = "https://paper-api.alpaca.markets"
 
@@ -22,7 +21,7 @@ const BASE_URL = "https://paper-api.alpaca.markets"
 const SYMBOL_TO_ANALYZE = "NVDA"
 const CASH_RISK_PER_TRADE = 0.02     # 2% cash risk per trade
 const MAX_POSITIONS = 25             # Max 25 concurrent positions
-const GROWTH_REQUIRED = 1.08         # Required growth (108%) over 2 years
+const MK_TREND_THRESHOLD = 1.64      # 95% Confidence in Uptrend
 const BUY_DROP_THRESHOLD = 0.04      # Buy if intraday drop > 4%
 const SELL_PROFIT_THRESHOLD = 0.015  # Sell if profit > 1.5%
 const CRASH_THRESHOLD = -0.08        # -8% Market drop = Panic (Liquidate all)
@@ -251,7 +250,36 @@ function get_long_term_history(symbol::String)
 end
 
 # ------------------------------------------------------------
-# 5. ORDERS AND MANAGEMENT
+# 5. MATHEMATICS & ALGORITHMS (MANN-KENDALL)
+# ------------------------------------------------------------
+
+function calculate_mann_kendall(prices::Vector{Float64})
+    n = length(prices)
+    if n < 10 return 0.0 end # Need data to calculate
+    
+    S = 0
+    # Compare every point to every future point
+    for i in 1:n-1
+        for j in i+1:n
+            S += sign(prices[j] - prices[i])
+        end
+    end
+    
+    # Calculate Variance to normalize (Z-score)
+    var_s = (n * (n - 1) * (2n + 5)) / 18
+    if S > 0
+        z = (S - 1) / sqrt(var_s)
+    elseif S < 0
+        z = (S + 1) / sqrt(var_s)
+    else
+        z = 0.0
+    end
+    
+    return z # Z-score > 1.96 usually means 95% confidence in trend
+end
+
+# ------------------------------------------------------------
+# 6. ORDERS AND MANAGEMENT
 # ------------------------------------------------------------
 
 function place_order(symbol::String, amount_or_qty::Float64, side::String)
@@ -305,7 +333,7 @@ function print_portfolio_status()
     end
 
     println("\n💼 --- CURRENT PORTFOLIO ---")
-    println("   SYM     | INVESTED | VALUE TODAY | PROFIT(\$) |    %")
+    println("   SYM      | INVESTED | VALUE TODAY | PROFIT(\$) |     %")
     
     total_invested = 0.0
     total_equity = 0.0
@@ -313,7 +341,7 @@ function print_portfolio_status()
     for (sym, pos) in active_positions
         curr = get_current_price(sym)
         if isnothing(curr) 
-            println("   $sym    | ...       | ...       | ...         | (Wait)")
+            println("   $sym     | ...        | ...        | ...          | (Wait)")
             continue 
         end
         
@@ -333,7 +361,7 @@ function print_portfolio_status()
         s_profit = "$(sign)\$$(round(profit_dollars, digits=2))"
         s_pct = "$(round(pl_pct*100, digits=2))%"
 
-        println("   $icon $sym | $s_invested   | $s_val   | $s_profit      | $s_pct")
+        println("   $icon $sym | $s_invested    | $s_val    | $s_profit       | $s_pct")
     end
     println("   -------------------------------------------------------")
 end
@@ -350,25 +378,24 @@ function run_diagnostic(symbol::String)
         return
     end
 
-    price_2_years_ago = long_history[1]
-    price_now = long_history[end]
+    # DIAGNOSTIC MK CHECK
+    mk_score = calculate_mann_kendall(long_history[end-100:end])
+    is_mk_ok = mk_score > MK_TREND_THRESHOLD
+    
     sma_50 = mean(long_history[end-49:end])
-    target_growth_price = price_2_years_ago * GROWTH_REQUIRED
+    is_above_sma = price > sma_50
 
-    println("📅 Price 2 years ago: \$$price_2_years_ago")
-    println("🎯 Target $(GROWTH_REQUIRED)x:      \$$target_growth_price")
+    println("📈 Mann-Kendall Z-Score: $mk_score")
+    println("   (Requires > $MK_TREND_THRESHOLD)")
     println("📈 50-Day SMA: \$$sma_50")
 
-    is_growth_ok = price_now >= target_growth_price
-    is_above_sma = price_now > sma_50
-
-    println("   Growth OK? $(is_growth_ok ? "YES ✅" : "NO ❌")")
-    println("   Above SMA 50?       $(is_above_sma ? "YES ✅" : "NO ❌")")
+    println("   Trend OK?       $(is_mk_ok ? "YES ✅" : "NO ❌")")
+    println("   Above SMA 50?   $(is_above_sma ? "YES ✅" : "NO ❌")")
     println("----------------------------------------------\n")
 end
 
 # ------------------------------------------------------------
-# 6. MAIN STRATEGY
+# 7. MAIN STRATEGY
 # ------------------------------------------------------------
 
 function check_market_health()
@@ -431,17 +458,21 @@ function run_strategy(current_symbols::Vector{String})
         if length(history_long) < 400 continue end 
 
         current_price = history_long[end]
-        price_2_years_ago = history_long[1]
-        threshold_price = price_2_years_ago * GROWTH_REQUIRED
         
-        # Filter 1: Growth
-        if current_price < threshold_price continue end
+        # --- NEW: Filter 1 (Mann-Kendall Trend) ---
+        # We check the last 100 days for a robust trend
+        trend_score = calculate_mann_kendall(history_long[end-100:end])
+        
+        if trend_score < MK_TREND_THRESHOLD
+            # println("   Skipping $sym: No Trend (Z: $trend_score)")
+            continue 
+        end
 
-        # Filter 2: SMA 50
+        # Filter 2: SMA 50 (Momentum Check)
         sma_50 = mean(history_long[end-49:end])
         if current_price < sma_50 continue end
         
-        # Filter 3: Intraday Dip
+        # Filter 3: Intraday Dip (Mean Reversion)
         history_hourly = get_hourly_history(sym)
         if length(history_hourly) < 10 continue end 
 
@@ -449,7 +480,7 @@ function run_strategy(current_symbols::Vector{String})
         drop_percentage = (recent_high - current_price) / recent_high
         
         if drop_percentage > 0.005
-             print("   $sym: -$(round(drop_percentage*100, digits=2))% | ")
+             print("   $sym: -$(round(drop_percentage*100, digits=2))% (MK:$(round(trend_score,digits=2))) | ")
         end
 
         if drop_percentage >= BUY_DROP_THRESHOLD
@@ -462,11 +493,11 @@ function run_strategy(current_symbols::Vector{String})
 
             if allocation >= 5.0 
                 if place_order(sym, allocation, "buy")
-                        println("      🚀 ORDER SENT: \$$allocation of $sym")
+                        println("       🚀 ORDER SENT: \$$allocation of $sym")
                         cash_available -= allocation
                 end
             else
-                println("      ⚠️ Insufficient cash ($cash_available) to open position.")
+                println("       ⚠️ Insufficient cash ($cash_available) to open position.")
             end
         end
     end
@@ -474,9 +505,9 @@ function run_strategy(current_symbols::Vector{String})
 end
 
 # ------------------------------------------------------------
-# 7. BOT EXECUTION
+# 8. BOT EXECUTION
 # ------------------------------------------------------------
-println("🤖 BOT PRO v9.0: ARMORED SYSTEM")
+println("🤖 BOT PRO v9.1: MANN-KENDALL EDITION")
 test_cash = get_account_cash()
 println("🔌 Alpaca connection test... Balance detected: \$$test_cash")
 
