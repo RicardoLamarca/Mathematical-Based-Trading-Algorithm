@@ -1,6 +1,4 @@
-# ========================================================
-# 🤖 TRADING BOT (ENGLISH VERSION)
-# ========================================================
+
 import Pkg
 println("--- 🔎 Verifying Libraries ---")
 required_packages = ["HTTP", "JSON", "Dates", "DataFrames", "Statistics", "Random"]
