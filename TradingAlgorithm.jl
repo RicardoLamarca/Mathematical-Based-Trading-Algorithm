@@ -20,8 +20,12 @@ const BASE_URL = "https://paper-api.alpaca.markets"
 # ------------------------------------------------------------
 const SYMBOL_TO_ANALYZE = "NVDA"
 const CASH_RISK_PER_TRADE = 0.02     # 2% cash risk per trade
-const MAX_POSITIONS = 25             # Max 25 concurrent positions
-const MK_TREND_THRESHOLD = 1.64      # 95% Confidence in Uptrend
+const MAX_POSITIONS = 26             # Max 26 concurrent positions
+
+# --- THE DUAL FILTERS ---
+const GROWTH_REQUIRED = 1.08         # 1. MUST be up 8% total over 2 years
+const MK_TREND_THRESHOLD = 1.64      # 2. MUST have Z-Score > 1.64 (95% Confidence)
+
 const BUY_DROP_THRESHOLD = 0.04      # Buy if intraday drop > 4%
 const SELL_PROFIT_THRESHOLD = 0.015  # Sell if profit > 1.5%
 const CRASH_THRESHOLD = -0.08        # -8% Market drop = Panic (Liquidate all)
@@ -41,14 +45,8 @@ active_positions = Dict{String, Position}()
 const SP500_CACHE = String[]
 
 function get_sp500_full_list()
-    # 1. If data is already cached, use it
-    if !isempty(SP500_CACHE)
-        return SP500_CACHE
-    end
-
+    if !isempty(SP500_CACHE); return SP500_CACHE; end
     println("🌐 Connecting to GitHub (Official 'datasets' repo)...")
-    
-    # NEW URL (CSV is more stable than personal JSONs)
     url = "https://raw.githubusercontent.com/datasets/s-and-p-500-companies/main/data/constituents.csv"
     
     # BACKUP LIST (In case of total internet failure)
@@ -93,50 +91,33 @@ function get_sp500_full_list()
         "BIO", "OGN"
     ]
     try
-        # Headers to avoid blocking
         headers = ["User-Agent" => "Mozilla/5.0"]
         r = HTTP.get(url, headers; readtimeout=30)
-        
-        # --- MANUAL CSV PARSING (NO EXTRA LIBS) ---
         raw_text = String(r.body)
-        lines = split(raw_text, '\n') # Split by lines
-        
+        lines = split(raw_text, '\n')
         symbols = String[]
-        
-        # Start at 2 because line 1 is headers (Symbol,Security,etc)
         for i in 2:length(lines)
             line = strip(lines[i])
             if isempty(line) continue end
-            
-            # Split by commas and take the first element (The Symbol)
             parts = split(line, ',')
-            sym = replace(String(parts[1]), "\"" => "") # Remove quotes if any
-            
-            # Fix for Alpaca (BRK-B -> BRK.B)
-            # Alpaca uses dots, Yahoo/Google sometimes use hyphens
+            sym = replace(String(parts[1]), "\"" => "")
             final_sym = replace(sym, "-" => ".")
-            
             push!(symbols, final_sym)
         end
-        
-        println("✅ CSV list downloaded and processed: $(length(symbols)) companies.")
+        println("✅ CSV list downloaded: $(length(symbols)) companies.")
         append!(SP500_CACHE, symbols)
         return symbols
-
     catch e
-        println("⚠️ Error downloading CSV ($e). Using backup list.")
+        println("⚠️ Error downloading CSV. Using backup list.")
         return backup_list
     end
 end
 
-
 function get_dynamic_universe(limit::Int=40)
-    # 1. Get the 500 (internet or cache)
     full_list = get_sp500_full_list()
-    
-    # 2. Shuffle and pick 40 randoms
     return first(shuffle(full_list), limit)
 end
+
 # ------------------------------------------------------------
 # 4. CONNECTION AND DATA
 # ------------------------------------------------------------
@@ -185,13 +166,11 @@ end
 
 function get_current_price(symbol::String)
     try
-        # Try realtime trade
         r = HTTP.get("https://data.alpaca.markets/v2/stocks/$symbol/trades/latest", get_headers())
         data = JSON.parse(String(r.body))
         return Float64(data["trade"]["p"])
     catch
         try
-            # Backup: 1 Minute bars
             url_backup = "https://data.alpaca.markets/v2/stocks/$symbol/bars?timeframe=1Min&limit=1"
             r = HTTP.get(url_backup, get_headers())
             data = JSON.parse(String(r.body))
@@ -199,9 +178,7 @@ function get_current_price(symbol::String)
                 return Float64(data["bars"][1]["c"])
             end
             return nothing
-        catch
-            return nothing
-        end
+        catch; return nothing; end
     end
 end
 
@@ -213,9 +190,7 @@ function get_yesterday_close(symbol::String)
         if haskey(data, "bars") && length(data["bars"]) >= 1
             return Float64(data["bars"][1]["c"])
         end
-    catch e
-        return nothing
-    end
+    catch e; return nothing; end
     return nothing
 end
 
@@ -225,13 +200,9 @@ function get_hourly_history(symbol::String)
     try
         r = HTTP.get(url, get_headers())
         data = JSON.parse(String(r.body))
-        if !haskey(data, "bars") || isnothing(data["bars"])
-            return Float64[]
-        end
+        if !haskey(data, "bars") || isnothing(data["bars"]); return Float64[]; end
         return [Float64(bar["c"]) for bar in data["bars"]]
-    catch e
-        return Float64[]
-    end
+    catch e; return Float64[]; end
 end
 
 function get_long_term_history(symbol::String)
@@ -240,13 +211,9 @@ function get_long_term_history(symbol::String)
     try
         r = HTTP.get(url, get_headers())
         data = JSON.parse(String(r.body))
-        if !haskey(data, "bars") || isnothing(data["bars"])
-            return Float64[]
-        end
+        if !haskey(data, "bars") || isnothing(data["bars"]); return Float64[]; end
         return [Float64(bar["c"]) for bar in data["bars"]]
-    catch e
-        return Float64[]
-    end
+    catch e; return Float64[]; end
 end
 
 # ------------------------------------------------------------
@@ -255,27 +222,18 @@ end
 
 function calculate_mann_kendall(prices::Vector{Float64})
     n = length(prices)
-    if n < 10 return 0.0 end # Need data to calculate
-    
+    if n < 10 return 0.0 end 
     S = 0
-    # Compare every point to every future point
     for i in 1:n-1
         for j in i+1:n
             S += sign(prices[j] - prices[i])
         end
     end
-    
-    # Calculate Variance to normalize (Z-score)
     var_s = (n * (n - 1) * (2n + 5)) / 18
-    if S > 0
-        z = (S - 1) / sqrt(var_s)
-    elseif S < 0
-        z = (S + 1) / sqrt(var_s)
-    else
-        z = 0.0
-    end
-    
-    return z # Z-score > 1.96 usually means 95% confidence in trend
+    if S > 0; z = (S - 1) / sqrt(var_s)
+    elseif S < 0; z = (S + 1) / sqrt(var_s)
+    else; z = 0.0; end
+    return z
 end
 
 # ------------------------------------------------------------
@@ -285,12 +243,8 @@ end
 function place_order(symbol::String, amount_or_qty::Float64, side::String)
     url = string(BASE_URL, "/v2/orders")
     body = Dict("symbol" => symbol, "side" => side, "type" => "market", "time_in_force" => "day")
-
-    if side == "buy"
-        body["notional"] = string(round(amount_or_qty, digits=2))
-    else
-        body["qty"] = string(amount_or_qty)
-    end
+    if side == "buy"; body["notional"] = string(round(amount_or_qty, digits=2))
+    else; body["qty"] = string(amount_or_qty); end
 
     try
         HTTP.post(url, get_headers(), JSON.json(body))
@@ -303,13 +257,8 @@ end
 
 function close_position(symbol::String)
     url = string(BASE_URL, "/v2/positions/$symbol")
-    try
-        HTTP.delete(url, get_headers())
-        return true
-    catch e
-        println("❌ Error closing position $symbol: $e")
-        return false
-    end
+    try; HTTP.delete(url, get_headers()); return true
+    catch e; println("❌ Error closing position $symbol: $e"); return false; end
 end
 
 function panic_sell_all()
@@ -318,49 +267,36 @@ function panic_sell_all()
     try
         HTTP.delete(url, get_headers())
         println("✅ SIGNAL RECEIVED. Closing everything.")
-        println("🛑 Bot stopped.")
         exit()
     catch e
-        println("❌ Error in Nuclear Option: $e")
-        exit()
+        println("❌ Error in Nuclear Option: $e"); exit()
     end
 end
 
 function print_portfolio_status()
     if isempty(active_positions)
-        println("💼 PORTFOLIO: [ Empty ]")
-        return
+        println("💼 PORTFOLIO: [ Empty ]"); return
     end
-
     println("\n💼 --- CURRENT PORTFOLIO ---")
     println("   SYM      | INVESTED | VALUE TODAY | PROFIT(\$) |     %")
     
     total_invested = 0.0
-    total_equity = 0.0
-
     for (sym, pos) in active_positions
         curr = get_current_price(sym)
         if isnothing(curr) 
-            println("   $sym     | ...        | ...        | ...          | (Wait)")
-            continue 
+            println("   $sym     | ...        | ...        | ...          | (Wait)"); continue 
         end
-        
         invested = pos.entry_price * pos.shares
         market_val = curr * pos.shares
         profit_dollars = market_val - invested
         pl_pct = (curr - pos.entry_price) / pos.entry_price
         
-        total_invested += invested
-        total_equity += market_val
-
         icon = pl_pct >= 0 ? "🟢" : "🔴"
         sign = profit_dollars >= 0 ? "+" : ""
-        
         s_invested = "\$$(round(invested, digits=2))"
         s_val = "\$$(round(market_val, digits=2))"
         s_profit = "$(sign)\$$(round(profit_dollars, digits=2))"
         s_pct = "$(round(pl_pct*100, digits=2))%"
-
         println("   $icon $sym | $s_invested    | $s_val    | $s_profit       | $s_pct")
     end
     println("   -------------------------------------------------------")
@@ -369,28 +305,32 @@ end
 function run_diagnostic(symbol::String)
     println("\n🔬 --- INITIAL DIAGNOSTIC: $symbol ---")
     price = get_current_price(symbol)
-    if isnothing(price) println("❌ Price error (Market closed or API bad)."); return end
+    if isnothing(price) println("❌ Price error."); return end
     println("📍 Current Price: \$$price")
 
     long_history = get_long_term_history(symbol) 
-    if length(long_history) < 300
-        println("⚠️ Not enough historical data.")
-        return
-    end
+    if length(long_history) < 300; println("⚠️ Not enough historical data."); return; end
 
-    # DIAGNOSTIC MK CHECK
+    # --- HYBRID DIAGNOSTIC CHECK ---
+    
+    # 1. GROWTH CHECK
+    price_2y = long_history[1]
+    growth_ok = price >= (price_2y * GROWTH_REQUIRED)
+
+    # 2. MK CHECK
     mk_score = calculate_mann_kendall(long_history[end-100:end])
     is_mk_ok = mk_score > MK_TREND_THRESHOLD
     
     sma_50 = mean(long_history[end-49:end])
     is_above_sma = price > sma_50
 
-    println("📈 Mann-Kendall Z-Score: $mk_score")
-    println("   (Requires > $MK_TREND_THRESHOLD)")
-    println("📈 50-Day SMA: \$$sma_50")
+    println("1. 8% Growth (2yr): $(round(price_2y, digits=2)) -> $(round(price_2y * GROWTH_REQUIRED, digits=2))")
+    println("   Pass?          $(growth_ok ? "YES ✅" : "NO ❌")")
+    
+    println("2. Trend Score:     $mk_score (Needs > $MK_TREND_THRESHOLD)")
+    println("   Pass?          $(is_mk_ok ? "YES ✅" : "NO ❌")")
 
-    println("   Trend OK?       $(is_mk_ok ? "YES ✅" : "NO ❌")")
-    println("   Above SMA 50?   $(is_above_sma ? "YES ✅" : "NO ❌")")
+    println("3. Above SMA 50?    $(is_above_sma ? "YES ✅" : "NO ❌")")
     println("----------------------------------------------\n")
 end
 
@@ -414,19 +354,15 @@ end
 
 function run_strategy(current_symbols::Vector{String})
     check_market_health()
-    
     equity_total = get_equity()
     cash_available = get_account_cash()
     
-    # 🛑 SECURITY CHECK
     if equity_total == 0.0 && cash_available == 0.0
-        println("⚠️ ALERT: 0 Balance detected. Check credentials or reset Paper Account.")
-        return
+        println("⚠️ ALERT: 0 Balance detected. Check credentials."); return
     end
 
     println("💰 CASH: \$$(round(cash_available, digits=2)) | TOTAL EQUITY: \$$(round(equity_total, digits=2))")
     print_portfolio_status() 
-    
     sync_positions()
 
     # --- SELLS ---
@@ -436,17 +372,14 @@ function run_strategy(current_symbols::Vector{String})
             target = pos.entry_price * (1 + SELL_PROFIT_THRESHOLD)
             if price >= target
                 println("✨ SELL (TP Hit)! Closing $sym...")
-                if close_position(sym)
-                    delete!(active_positions, sym)
-                end
+                if close_position(sym); delete!(active_positions, sym); end
             end
         end
     end
 
     # --- BUYS ---
     if length(active_positions) >= MAX_POSITIONS
-        println("✋ Position limit reached. Only watching for sells.")
-        return 
+        println("✋ Position limit reached. Only watching for sells."); return 
     end
 
     println("🕒 Scanning opportunities in batch of $(length(current_symbols)) stocks...")
@@ -458,21 +391,26 @@ function run_strategy(current_symbols::Vector{String})
         if length(history_long) < 400 continue end 
 
         current_price = history_long[end]
+        price_2y = history_long[1] # Approx 2 years ago (start of buffer)
+
+        # --- FILTER 1: GROWTH (MAGNITUDE) ---
+        # "Is it actually worth more than it was 2 years ago?"
+        if current_price < (price_2y * GROWTH_REQUIRED)
+             continue 
+        end
         
-        # --- NEW: Filter 1 (Mann-Kendall Trend) ---
-        # We check the last 100 days for a robust trend
+        # --- FILTER 2: MANN-KENDALL (CONSISTENCY) ---
+        # "Is the move upward steady and reliable?"
         trend_score = calculate_mann_kendall(history_long[end-100:end])
-        
         if trend_score < MK_TREND_THRESHOLD
-            # println("   Skipping $sym: No Trend (Z: $trend_score)")
             continue 
         end
 
-        # Filter 2: SMA 50 (Momentum Check)
+        # --- FILTER 3: SMA 50 (MOMENTUM) ---
         sma_50 = mean(history_long[end-49:end])
         if current_price < sma_50 continue end
         
-        # Filter 3: Intraday Dip (Mean Reversion)
+        # --- FILTER 4: INTRADAY DIP (ENTRY) ---
         history_hourly = get_hourly_history(sym)
         if length(history_hourly) < 10 continue end 
 
@@ -487,17 +425,13 @@ function run_strategy(current_symbols::Vector{String})
             println("\n -> 🎯 OPPORTUNITY CONFIRMED! $sym")
             
             allocation = equity_total * CASH_RISK_PER_TRADE
-            if allocation > cash_available
-                allocation = cash_available - 5.0 
-            end
+            if allocation > cash_available; allocation = cash_available - 5.0; end
 
             if allocation >= 5.0 
                 if place_order(sym, allocation, "buy")
                         println("       🚀 ORDER SENT: \$$allocation of $sym")
                         cash_available -= allocation
                 end
-            else
-                println("       ⚠️ Insufficient cash ($cash_available) to open position.")
             end
         end
     end
@@ -507,7 +441,7 @@ end
 # ------------------------------------------------------------
 # 8. BOT EXECUTION
 # ------------------------------------------------------------
-println("🤖 BOT PRO v9.1: MANN-KENDALL EDITION")
+println("🤖 BOT PRO v9.5: HYBRID EDITION (MK + 8% GROWTH)")
 test_cash = get_account_cash()
 println("🔌 Alpaca connection test... Balance detected: \$$test_cash")
 
@@ -526,8 +460,6 @@ while true
         global ticks
         ticks += 1
         if ticks % 5 == 0; sync_positions(); end 
-        
-        # Use the secure list, not random internet JSONs
         cycle_symbols = get_dynamic_universe(500) 
         run_strategy(cycle_symbols)
     catch e
