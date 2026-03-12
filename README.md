@@ -1,94 +1,104 @@
-# Mathematical-Based-Trading-Algorithm
+# 🤖 Algo Engine Pro v10.0 | Quantitative Trading Core
 
-![Julia](https://img.shields.io/badge/Made%20with-Julia-9558B2?style=flat&logo=julia)
-![License](https://img.shields.io/badge/License-MIT-green)
-![Status](https://img.shields.io/badge/Status-Active-success)
+![Julia](https://img.shields.io/badge/Core-Julia_1.10+-9558B2?style=for-the-badge&logo=julia)
+![Python](https://img.shields.io/badge/Telemetry-Python_3.9+-3776AB?style=for-the-badge&logo=python)
+![Broker](https://img.shields.io/badge/Broker-Alpaca_API-F5C518?style=for-the-badge)
+![License](https://img.shields.io/badge/License-MIT-success?style=for-the-badge)
 
-A high-performance algorithmic trading bot written in **Julia**. This system automates the analysis, selection, and execution of trades using the **Alpaca Paper Trading API**.
+Welcome to **Algo Engine Pro**, a high-performance algorithmic trading system built for the US Equities market (S&P 500). 
 
-The bot utilizes a **Hybrid Statistical Strategy**, combining **absolute magnitude** (Minimum Growth) with **statistical consistency** (Mann-Kendall Trend Test) to identify high-probability "dip buying" opportunities within the S&P 500.
-
-## 🚀 Key Features
-
-* **Hybrid Trend Engine:** Uses a dual-layer filter (Magnitude + Consistency) to separate luck from true performance.
-* **Dynamic Universe:** Automatically downloads, parses, and shuffles the S&P 500 constituents list.
-* **Risk Management:** Strict position sizing (default 2% equity per trade) and portfolio limits (Max 26 positions).
-* **Market "Circuit Breaker":** Automatically liquidates all positions if the broad market (SPY/QQQ) crashes significantly.
-* **High Performance:** Leveraging Julia's speed for real-time statistical analysis and decision making.
+This project uses a **Dual-Engine Architecture**:
+1. **The Brain (Julia):** A highly optimized execution engine that handles market data streaming, mathematical trend analysis, and order routing via the Alpaca API.
+2. **The Dashboard (Python/Streamlit):** A real-time, zero-latency web interface that reads live telemetry from the Julia engine via a lightweight SQLite database.
 
 ---
 
-## 🧠 Mathematical Logic & Strategy
+## 🧮 Mathematical Background & Logic
 
-The bot operates on a "Buy the Dip, Sell the Rip" philosophy, but with strict safety filters. A trade is only executed if a stock passes **all** of the following mathematical conditions simultaneously:
+The trading logic is built on a multi-layered quantitative approach, ensuring that capital is only deployed when statistical, momentum, and mean-reversion alignments occur.
 
-### 1. Magnitude Filter (The "8% Rule")
-First, the bot checks if the asset has actually gained value over the long term. It compares the current price ($P_{t}$) against the price from 2 years ago ($P_{t-2y}$).
+### 1. The Mann-Kendall Trend Test (Statistical Confidence)
+Instead of relying purely on simple moving averages, the bot evaluates the historical price action using the Mann-Kendall (MK) test. This is a non-parametric test used to identify monotonic trends over time.
 
-$$P_{t} \geq P_{t-2y} \times 1.08$$
+First, the algorithm calculates the $S$ statistic by comparing all pairs of data points in the last 100 days:
+$$S = \sum_{i=1}^{n-1} \sum_{j=i+1}^{n} \text{sgn}(x_j - x_i)$$
 
-* **Logic:** The stock must have grown at least **8%** over the last two years. This filters out stocks that are volatile but ultimately stagnant or declining.
+Then, it computes the variance of $S$:
+$$Var(S) = \frac{n(n-1)(2n+5)}{18}$$
 
-### 2. Consistency Filter (Mann-Kendall Trend Test)
-To ensure the growth isn't just a random spike, the bot performs a non-parametric **Mann-Kendall Test** on the last 100 days of data. It calculates a Z-Score ($Z_{MK}$) to quantify the probability of a consistent uptrend.
+Finally, the standard normal test statistic (Z-score) is calculated (assuming $S > 0$ for uptrends):
+$$Z = \frac{S - 1}{\sqrt{Var(S)}}$$
 
-$$S = \sum_{i=1}^{n-1} \sum_{j=i+1}^{n} \text{sgn}(P_j - P_i)$$
+**Implementation:** The bot requires a Z-score of **> 1.64**. In a one-sided test, a Z-score of 1.64 corresponds to a **95% statistical confidence** that the asset is in a reliable upward trend.
 
-$$Z_{MK} = \frac{S - 1}{\sqrt{\frac{n(n-1)(2n+5)}{18}}}$$
+### 2. Momentum & Baseline Growth
+Alongside the statistical confidence, the asset must pass structural growth checks:
+* **2-Year Growth Requirement:** The current price must be mathematically strictly greater than 110% of its price two years ago ($P_{current} \ge P_{t-2yrs} \times 1.10$).
+* **50-Day Momentum:** The current price must be trading above its 50-day Simple Moving Average (SMA), calculated as:
+$$\text{SMA}_{50} = \frac{1}{50} \sum_{i=1}^{50} P_i$$
 
-$$Condition: Z_{MK} > 1.64$$
-
-* **Logic:** A Z-Score $> 1.64$ indicates a **95% statistical confidence** that the uptrend is non-random. This filters out "choppy" stocks that are dangerous to trade.
-
-### 3. Momentum Filter (SMA 50)
-The bot calculates the 50-Day Simple Moving Average (SMA) to determine the medium-term market sentiment.
-
-$$Condition: P_{t} > SMA_{50}$$
-
-* **Logic:** The current price must be **above** its 50-day average. We want to buy dips in verified uptrends, not catch falling knives.
-
-### 4. Mean Reversion Entry (Intraday Dip)
-The bot analyzes the last 50 trading hours to find the recent high ($P_{high}$). It calculates the percentage drop ($\Delta \%$) to the current price.
-
-$$\Delta \% = \frac{P_{high} - P_{current}}{P_{high}}$$
-
-$$Condition: \Delta \% \ge 0.04$$
-
-* **Logic:** We only buy if the stock has dropped **4% or more** from its recent hourly high, betting on a short-term statistical reversion to the mean.
-
-### 5. Exit Strategy
-Once a position is open, the bot monitors it continuously.
-
-$$P_{current} \ge P_{entry} \times (1 + 0.015)$$
-
-* **Logic:** Secure profits immediately once the asset rises **1.5%** above the entry price.
+### 3. Mean Reversion Trigger (Intraday Drop)
+If a stock passes the macro trend and momentum filters, the bot waits for a localized mean-reversion opportunity. It measures the intraday percentage drop from the daily high ($P_{high}$):
+$$\text{Drop \%} = \frac{P_{high} - P_{current}}{P_{high}}$$
+The bot executes a buy order only when the drop exceeds **4%** (0.04), securing a favorable statistical entry point within a macro uptrend.
 
 ---
 
-## 🛠️ Configuration
+### 📈 Strategy Execution & Risk Management
 
-You can adjust the strategy parameters in the `Configuration` section of the code:
+### The Entry Setup
+Before deploying capital (5% risk per trade), a stock must pass **all** the mathematical conditions outlined above: 10% macro growth, 95% MK Trend Confidence, > 50 SMA, and > 4% intraday drop.
 
-| Constant | Default | Description |
-| :--- | :--- | :--- |
-| `CASH_RISK_PER_TRADE` | `0.02` | Allocates 2% of total equity per trade. |
-| `MAX_POSITIONS` | `26` | Maximum number of concurrent open positions. |
-| `GROWTH_REQUIRED` | `1.08` | Requires 8% total price growth over 2 years. |
-| `MK_TREND_THRESHOLD` | `1.64` | **New:** Requires 95% confidence in trend consistency. |
-| `BUY_DROP_THRESHOLD` | `0.04` | Buys when price drops 4% from recent high. |
-| `SELL_PROFIT_THRESHOLD` | `0.015` | Sells when profit hits 1.5%. |
-| `CRASH_THRESHOLD` | `-0.08` | **Nuclear Option:** Liquidates everything if market drops 8%. |
+### The Exit Logic
+* **Standard Take Profit:** Sells automatically when the position reaches **+1.5%** profit from the entry price.
+* **🦘 Bounce Recovery:** If the stock drops below the entry price, the bot tracks the new local bottom. If it then bounces **1.5%** from that bottom, the bot dynamically closes the position to mitigate further downside risk.
+* **☢️ The Nuclear Option (Market Crash):** If the broader market (SPY/QQQ) drops by **8%** in a single day, the bot triggers a total portfolio liquidation, canceling all pending orders and selling all active positions to cash.
 
 ---
 
-## 📦 Installation & Usage
+### 🏗️ Architecture & Telemetry
 
-### 1. Prerequisites
-* **Install Julia:** Download it from [julialang.org](https://julialang.org/downloads/).
-* **Alpaca Account:** Sign up at [Alpaca Markets](https://alpaca.markets/) and generate **Paper Trading API Keys**.
+The system avoids heavy inter-process communication (IPC) overhead by using **SQLite** as a shared, real-time memory state.
 
-### 2. Setup
-Clone the repository:
-```bash
-git clone [https://github.com/YOUR_USERNAME/YOUR_REPO_NAME.git](https://github.com/YOUR_USERNAME/YOUR_REPO_NAME.git)
-cd YOUR_REPO_NAME
+* **bot.jl (Julia)** scans the market, executes trades, and constantly updates `bot_data.sqlite` with the portfolio state and active positions.
+* **dashboard.py (Python/Streamlit)** independently queries `bot_data.sqlite` every 5 seconds to render a live, Bloomberg-style terminal UI.
+
+---
+
+### 🚀 Setup & Installation
+
+### Prerequisites
+* **Julia** (v1.10 or higher)
+* **Python** (v3.9 or higher)
+* An **Alpaca Markets** Paper Trading Account (API Key & Secret)
+
+### Step 1: Clone the Repository
+    git clone https://github.com/YOUR_USERNAME/YOUR_REPO_NAME.git
+    cd YOUR_REPO_NAME
+
+### Step 2: Configure API Keys
+Open `bot.jl` and replace the placeholder keys with your actual Alpaca **Paper Trading** keys.
+(⚠️ CRITICAL: Never commit your actual API keys to GitHub. Keep them secure!)
+    
+    const API_KEY = "YOUR_API_KEY_HERE"      
+    const SECRET_KEY = "YOUR_SECRET_KEY_HERE" 
+
+### Step 3: Start the Julia Execution Core
+Open your terminal, navigate to the project folder, and run:
+    
+    julia bot.jl
+
+(Note: On the first run, Julia will automatically install the required dependencies: HTTP, JSON, DataFrames, SQLite, etc.)
+
+### Step 4: Launch the Live Dashboard
+Open a **second** terminal window, navigate to the exact same project folder, install the Python requirements, and start Streamlit:
+    
+    pip install streamlit pandas plotly
+    python -m streamlit run dashboard.py
+
+The dashboard will open automatically in your browser at http://localhost:8501.
+
+---
+
+### ⚠️ Disclaimer
+**Not Financial Advice.** This software is for educational and research purposes only. Do not use this algorithm with real money (live trading) without thoroughly backtesting and understanding the risks involved. The author is not responsible for any financial losses incurred. Use the Alpaca **Paper Trading** environment to test it safely.
