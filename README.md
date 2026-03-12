@@ -1,4 +1,4 @@
-# 🤖 Algo Engine Pro v10.0 | Quantitative Trading Core
+# 🤖 AUTOMATIZED MATHEMATICAL TRADING ALGORITHM  | Quantitative Trading Core
 
 ![Julia](https://img.shields.io/badge/Core-Julia_1.10+-9558B2?style=for-the-badge&logo=julia)
 ![Python](https://img.shields.io/badge/Telemetry-Python_3.9+-3776AB?style=for-the-badge&logo=python)
