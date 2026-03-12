@@ -1,40 +1,55 @@
+# ========================================================
+# 🤖 TRADING BOT PRO - DUAL ENGINE & DB EDITION
+# ========================================================
 import Pkg
-println("--- 🔎 Verifying Libraries ---")
-required_packages = ["HTTP", "JSON", "Dates", "DataFrames", "Statistics", "Random"]
+println("--- 🔎 Verificando Librerías ---")
+required_packages = ["HTTP", "JSON", "Dates", "DataFrames", "Statistics", "Random", "SQLite"]
 for pkg in required_packages
     if !haskey(Pkg.project().dependencies, pkg)
-        println("   + Installing $pkg...")
+        println("   + Instalando $pkg...")
         Pkg.add(pkg)
     end
 end
 using HTTP, JSON, Dates, DataFrames, Statistics, Random
-println("--- ✅ Libraries Ready ---\n")
+using SQLite
 
-# 🔴 PASTE YOUR KEYS HERE 🔴
-const API_KEY = "YOUR ALPACA API KEY"        
-const SECRET_KEY = "YOUR ALPACA SECRET KEY" 
+# --- CONEXIÓN A LA BASE DE DATOS (TELEMETRÍA) ---
+println("--- 🗄️ Conectando Base de Datos ---")
+const DB = SQLite.DB("bot_data.sqlite")
+
+# Creamos las tablas si no existen para que Python las lea
+SQLite.execute(DB, "CREATE TABLE IF NOT EXISTS history (timestamp DATETIME, equity REAL, cash REAL)")
+SQLite.execute(DB, "CREATE TABLE IF NOT EXISTS positions (symbol TEXT, shares REAL, entry_price REAL, current_price REAL, profit_pct REAL)")
+println("--- ✅ Librerías Listas ---\n")
+
+# 🔴 PEGA TUS CLAVES AQUÍ (NUNCA LAS SUBAS A GITHUB) 🔴
+const API_KEY = "YOUR_API_KEY_HERE"      
+const SECRET_KEY = "YOUR_SECRET_KEY_HERE" 
 const BASE_URL = "https://paper-api.alpaca.markets"
 
 # ------------------------------------------------------------
 # ⚙️ 2. CONFIGURATION
 # ------------------------------------------------------------
 const SYMBOL_TO_ANALYZE = "NVDA"
-const CASH_RISK_PER_TRADE = 0.02     # 2% cash risk per trade
-const MAX_POSITIONS = 26             # Max 26 concurrent positions
+const CASH_RISK_PER_TRADE = 0.05     # 5% cash risk per trade
+const MAX_POSITIONS = 20             # Max 20 concurrent positions
 
-# --- THE DUAL FILTERS ---
-const GROWTH_REQUIRED = 1.08         # 1. MUST be up 8% total over 2 years
+# --- THE FILTERS ---
+const GROWTH_REQUIRED = 1.1         # 1. MUST be up 10% total over 2 years
 const MK_TREND_THRESHOLD = 1.64      # 2. MUST have Z-Score > 1.64 (95% Confidence)
 
 const BUY_DROP_THRESHOLD = 0.04      # Buy if intraday drop > 4%
 const SELL_PROFIT_THRESHOLD = 0.015  # Sell if profit > 1.5%
+const BOUNCE_PROFIT_THRESHOLD = 0.015 # Sell if it bounces 1.5% from its lowest point
 const CRASH_THRESHOLD = -0.08        # -8% Market drop = Panic (Liquidate all)
 
-# Memory Structure
+# Memory Structure (BOUNCE RECOVERY UPGRADE)
 mutable struct Position
     symbol::String
     entry_price::Float64
     shares::Float64 
+    lowest_price::Float64  # Rastrea el fondo
+    entry_time::DateTime   # Rastrea el tiempo
 end
 active_positions = Dict{String, Position}()
 
@@ -152,12 +167,35 @@ function sync_positions()
     try
         r = HTTP.get(string(BASE_URL, "/v2/positions"), get_headers())
         positions_data = JSON.parse(String(r.body))
-        empty!(active_positions)
+        
+        current_api_symbols = Set{String}()
+        
         for p in positions_data
             sym = p["symbol"]
+            push!(current_api_symbols, sym)
             qty = parse(Float64, p["qty"]) 
             entry = parse(Float64, p["avg_entry_price"])
-            active_positions[sym] = Position(sym, entry, qty)
+            curr_price = parse(Float64, p["current_price"])
+
+            if haskey(active_positions, sym)
+                # Mantener memoria de mínimos y tiempo
+                pos = active_positions[sym]
+                pos.shares = qty
+                pos.entry_price = entry
+                if curr_price < pos.lowest_price
+                    pos.lowest_price = curr_price
+                end
+            else
+                # Nueva posición
+                active_positions[sym] = Position(sym, entry, qty, min(entry, curr_price), now())
+            end
+        end
+
+        # Eliminar las que ya no están en Alpaca
+        for sym in keys(active_positions)
+            if !(sym in current_api_symbols)
+                delete!(active_positions, sym)
+            end
         end
     catch e
         println("❌ Error syncing positions: $e")
@@ -250,7 +288,7 @@ function place_order(symbol::String, amount_or_qty::Float64, side::String)
         HTTP.post(url, get_headers(), JSON.json(body))
         return true
     catch e
-        println("❌ Order Failed ($side $symbol). Possible PDT block? Error: $e")
+        println("❌ Order Failed ($side $symbol). Error: $e")
         return false
     end
 end
@@ -281,6 +319,8 @@ function print_portfolio_status()
     println("   SYM      | INVESTED | VALUE TODAY | PROFIT(\$) |     %")
     
     total_invested = 0.0
+    SQLite.execute(DB, "DELETE FROM positions") # Limpiamos la foto anterior para el Dashboard
+    
     for (sym, pos) in active_positions
         curr = get_current_price(sym)
         if isnothing(curr) 
@@ -292,12 +332,15 @@ function print_portfolio_status()
         pl_pct = (curr - pos.entry_price) / pos.entry_price
         
         icon = pl_pct >= 0 ? "🟢" : "🔴"
-        sign = profit_dollars >= 0 ? "+" : ""
+        sign_str = profit_dollars >= 0 ? "+" : ""
         s_invested = "\$$(round(invested, digits=2))"
         s_val = "\$$(round(market_val, digits=2))"
-        s_profit = "$(sign)\$$(round(profit_dollars, digits=2))"
+        s_profit = "$(sign_str)\$$(round(profit_dollars, digits=2))"
         s_pct = "$(round(pl_pct*100, digits=2))%"
-        println("   $icon $sym | $s_invested    | $s_val    | $s_profit       | $s_pct")
+        println("   $icon $sym | $s_invested    | $s_val    | $s_profit        | $s_pct")
+        
+        # INSERT INTO DATABASE FOR PYTHON DASHBOARD
+        SQLite.execute(DB, "INSERT INTO positions (symbol, shares, entry_price, current_price, profit_pct) VALUES ('$sym', $(pos.shares), $(pos.entry_price), $curr, $pl_pct)")
     end
     println("   -------------------------------------------------------")
 end
@@ -311,25 +354,17 @@ function run_diagnostic(symbol::String)
     long_history = get_long_term_history(symbol) 
     if length(long_history) < 300; println("⚠️ Not enough historical data."); return; end
 
-    # --- HYBRID DIAGNOSTIC CHECK ---
-    
-    # 1. GROWTH CHECK
     price_2y = long_history[1]
     growth_ok = price >= (price_2y * GROWTH_REQUIRED)
-
-    # 2. MK CHECK
     mk_score = calculate_mann_kendall(long_history[end-100:end])
     is_mk_ok = mk_score > MK_TREND_THRESHOLD
-    
     sma_50 = mean(long_history[end-49:end])
     is_above_sma = price > sma_50
 
-    println("1. 8% Growth (2yr): $(round(price_2y, digits=2)) -> $(round(price_2y * GROWTH_REQUIRED, digits=2))")
+    println("1. $(round((GROWTH_REQUIRED-1)*100, digits=0))% Growth (2yr): $(round(price_2y, digits=2)) -> $(round(price_2y * GROWTH_REQUIRED, digits=2))")
     println("   Pass?          $(growth_ok ? "YES ✅" : "NO ❌")")
-    
     println("2. Trend Score:     $mk_score (Needs > $MK_TREND_THRESHOLD)")
     println("   Pass?          $(is_mk_ok ? "YES ✅" : "NO ❌")")
-
     println("3. Above SMA 50?    $(is_above_sma ? "YES ✅" : "NO ❌")")
     println("----------------------------------------------\n")
 end
@@ -361,17 +396,34 @@ function run_strategy(current_symbols::Vector{String})
         println("⚠️ ALERT: 0 Balance detected. Check credentials."); return
     end
 
+    # --- DB: GUARDAR HISTORIAL EN TIEMPO REAL ---
+    current_time = Dates.format(now(), "yyyy-mm-dd HH:MM:SS")
+    SQLite.execute(DB, "INSERT INTO history (timestamp, equity, cash) VALUES ('$current_time', $equity_total, $cash_available)")
+
     println("💰 CASH: \$$(round(cash_available, digits=2)) | TOTAL EQUITY: \$$(round(equity_total, digits=2))")
     print_portfolio_status() 
     sync_positions()
 
-    # --- SELLS ---
+    # --- SELLS (TAKE PROFIT & BOUNCE RECOVERY) ---
     for (sym, pos) in active_positions
         price = get_current_price(sym)
         if !isnothing(price)
-            target = pos.entry_price * (1 + SELL_PROFIT_THRESHOLD)
-            if price >= target
-                println("✨ SELL (TP Hit)! Closing $sym...")
+            # Actualizamos el fondo en vivo por si acaso cae más
+            if price < pos.lowest_price
+                pos.lowest_price = price
+            end
+
+            target_tp = pos.entry_price * (1 + SELL_PROFIT_THRESHOLD)
+            target_bounce = pos.lowest_price * (1 + BOUNCE_PROFIT_THRESHOLD)
+
+            # 1. Standard Take Profit
+            if price >= target_tp
+                println("✨ SELL (Take Profit Hit)! Closing $sym...")
+                if close_position(sym); delete!(active_positions, sym); end
+            
+            # 2. Bounce Recovery Logic (Solo si rebotó desde más abajo de nuestro punto de entrada)
+            elseif price >= target_bounce && pos.lowest_price < pos.entry_price
+                println("🦘 SELL (Bounce Recovery)! Closing $sym after 1.5% bounce from bottom...")
                 if close_position(sym); delete!(active_positions, sym); end
             end
         end
@@ -391,26 +443,20 @@ function run_strategy(current_symbols::Vector{String})
         if length(history_long) < 400 continue end 
 
         current_price = history_long[end]
-        price_2y = history_long[1] # Approx 2 years ago (start of buffer)
+        price_2y = history_long[1]
 
-        # --- FILTER 1: GROWTH (MAGNITUDE) ---
-        # "Is it actually worth more than it was 2 years ago?"
         if current_price < (price_2y * GROWTH_REQUIRED)
              continue 
         end
         
-        # --- FILTER 2: MANN-KENDALL (CONSISTENCY) ---
-        # "Is the move upward steady and reliable?"
         trend_score = calculate_mann_kendall(history_long[end-100:end])
         if trend_score < MK_TREND_THRESHOLD
             continue 
         end
 
-        # --- FILTER 3: SMA 50 (MOMENTUM) ---
         sma_50 = mean(history_long[end-49:end])
         if current_price < sma_50 continue end
         
-        # --- FILTER 4: INTRADAY DIP (ENTRY) ---
         history_hourly = get_hourly_history(sym)
         if length(history_hourly) < 10 continue end 
 
@@ -429,7 +475,7 @@ function run_strategy(current_symbols::Vector{String})
 
             if allocation >= 5.0 
                 if place_order(sym, allocation, "buy")
-                        println("       🚀 ORDER SENT: \$$allocation of $sym")
+                        println("        🚀 ORDER SENT: \$$allocation of $sym")
                         cash_available -= allocation
                 end
             end
@@ -441,7 +487,7 @@ end
 # ------------------------------------------------------------
 # 8. BOT EXECUTION
 # ------------------------------------------------------------
-println("🤖 BOT PRO v9.5: HYBRID EDITION (MK + 8% GROWTH)")
+println("🤖 BOT PRO v10.0: HYBRID + BOUNCE + DB DASHBOARD")
 test_cash = get_account_cash()
 println("🔌 Alpaca connection test... Balance detected: \$$test_cash")
 
